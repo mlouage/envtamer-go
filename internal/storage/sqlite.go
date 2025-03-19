@@ -9,6 +9,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// Storage represents a SQLite database connection
 type Storage struct {
 	db *sql.DB
 }
@@ -34,24 +35,17 @@ func New() (*Storage, error) {
 	return &Storage{db: db}, nil
 }
 
-// Init initializes the database tables
 func (s *Storage) Init() error {
 	_, err := s.db.Exec(`
-		CREATE TABLE IF NOT EXISTS directories (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			path TEXT UNIQUE
-		);
-		CREATE TABLE IF NOT EXISTS env_vars (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			directory_id INTEGER,
-			key TEXT,
-			value TEXT,
-			FOREIGN KEY (directory_id) REFERENCES directories(id),
-			UNIQUE(directory_id, key)
-		);
+		CREATE TABLE IF NOT EXISTS "EnvVariables" (
+            "Directory" TEXT NOT NULL,
+            "Key" TEXT NOT NULL,
+            "Value" TEXT NOT NULL,
+            CONSTRAINT "PK_EnvVariables" PRIMARY KEY ("Directory", "Key")
+        );
 	`)
 	if err != nil {
-		return fmt.Errorf("failed to initialize database tables: %w", err)
+		return fmt.Errorf("failed to initialize database table: %w", err)
 	}
 	return nil
 }
@@ -69,40 +63,21 @@ func (s *Storage) SaveEnvVars(directory string, envVars map[string]string) error
 	}
 	defer tx.Rollback()
 
-	// Get or create directory
-	var dirID int
-	err = tx.QueryRow("SELECT id FROM directories WHERE path = ?", directory).Scan(&dirID)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			result, err := tx.Exec("INSERT INTO directories (path) VALUES (?)", directory)
-			if err != nil {
-				return fmt.Errorf("failed to insert directory: %w", err)
-			}
-			id, err := result.LastInsertId()
-			if err != nil {
-				return fmt.Errorf("failed to get last insert ID: %w", err)
-			}
-			dirID = int(id)
-		} else {
-			return fmt.Errorf("failed to query directory: %w", err)
-		}
-	}
-
 	// Delete existing env vars for this directory
-	_, err = tx.Exec("DELETE FROM env_vars WHERE directory_id = ?", dirID)
+	_, err = tx.Exec("DELETE FROM EnvVariables WHERE Directory = ?", directory)
 	if err != nil {
 		return fmt.Errorf("failed to delete existing env vars: %w", err)
 	}
 
 	// Insert new env vars
-	stmt, err := tx.Prepare("INSERT INTO env_vars (directory_id, key, value) VALUES (?, ?, ?)")
+	stmt, err := tx.Prepare("INSERT INTO EnvVariables (Directory, Key, Value) VALUES (?, ?, ?)")
 	if err != nil {
 		return fmt.Errorf("failed to prepare statement: %w", err)
 	}
 	defer stmt.Close()
 
 	for key, value := range envVars {
-		_, err = stmt.Exec(dirID, key, value)
+		_, err = stmt.Exec(directory, key, value)
 		if err != nil {
 			return fmt.Errorf("failed to insert env var: %w", err)
 		}
@@ -117,16 +92,7 @@ func (s *Storage) SaveEnvVars(directory string, envVars map[string]string) error
 
 // GetEnvVars retrieves environment variables for a directory
 func (s *Storage) GetEnvVars(directory string) (map[string]string, error) {
-	var dirID int
-	err := s.db.QueryRow("SELECT id FROM directories WHERE path = ?", directory).Scan(&dirID)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("directory not found: %s", directory)
-		}
-		return nil, fmt.Errorf("failed to query directory: %w", err)
-	}
-
-	rows, err := s.db.Query("SELECT key, value FROM env_vars WHERE directory_id = ?", dirID)
+	rows, err := s.db.Query("SELECT Key, Value FROM EnvVariables WHERE Directory = ?", directory)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query env vars: %w", err)
 	}
@@ -145,12 +111,24 @@ func (s *Storage) GetEnvVars(directory string) (map[string]string, error) {
 		return nil, fmt.Errorf("error during rows iteration: %w", err)
 	}
 
+	if len(envVars) == 0 {
+		// Check if directory exists at all
+		var count int
+		err := s.db.QueryRow("SELECT COUNT(*) FROM EnvVariables WHERE Directory = ?", directory).Scan(&count)
+		if err != nil {
+			return nil, fmt.Errorf("failed to check directory existence: %w", err)
+		}
+		if count == 0 {
+			return nil, fmt.Errorf("directory not found: %s", directory)
+		}
+	}
+
 	return envVars, nil
 }
 
 // ListDirectories lists all directories
 func (s *Storage) ListDirectories() ([]string, error) {
-	rows, err := s.db.Query("SELECT path FROM directories")
+	rows, err := s.db.Query("SELECT DISTINCT Directory FROM EnvVariables")
 	if err != nil {
 		return nil, fmt.Errorf("failed to query directories: %w", err)
 	}
@@ -158,11 +136,11 @@ func (s *Storage) ListDirectories() ([]string, error) {
 
 	var directories []string
 	for rows.Next() {
-		var path string
-		if err := rows.Scan(&path); err != nil {
+		var dir string
+		if err := rows.Scan(&dir); err != nil {
 			return nil, fmt.Errorf("failed to scan row: %w", err)
 		}
-		directories = append(directories, path)
+		directories = append(directories, dir)
 	}
 
 	if err := rows.Err(); err != nil {
